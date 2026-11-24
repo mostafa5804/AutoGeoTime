@@ -1,0 +1,60 @@
+name: Build Windows Portable EXE
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: دریافت سورس کد از مخزن
+        uses: actions/checkout@v4
+
+      - name: راه‌اندازی پایتون 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: نصب وابستگی‌ها
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: دانلود فونت وزیرمتن (Vazirmatn) برای باندل شدن در EXE
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf" -OutFile "Vazirmatn-Regular.ttf"
+          Invoke-WebRequest -Uri "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf" -OutFile "Vazirmatn-Bold.ttf"
+
+      - name: تولید خودکار آیکون ویندوز (app_icon.ico)
+        shell: pwsh
+        run: |
+          python -c "import AutoGeoTime; AutoGeoTime.ensure_ico_file()"
+
+      - name: ساخت فایل اجرایی پرتابل (PyInstaller)
+        shell: pwsh
+        run: |
+          pyinstaller --noconsole --onefile --icon="app_icon.ico" --add-data "Vazirmatn-Regular.ttf;." --add-data "Vazirmatn-Bold.ttf;." --name "AutoGeoTime" AutoGeoTime.py
+
+      - name: آپلود فایل بیلد در Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoGeoTime-Windows-Portable
+          path: dist/AutoGeoTime.exe
+
+      - name: انتشار خودکار در GitHub Releases (در صورت ایجاد تگ نسخه)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AutoGeoTime.exe
+          generate_release_notes: true
