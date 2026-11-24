@@ -147,6 +147,7 @@ COUNTRY_TO_LOCALE = {
 }
 
 APP_NAME = "AutoGeoTime"
+FW_RULE_NAME = "AutoGeoTime_Block_Online_Geolocation"
 MUTEX_NAME = "Local\\AutoGeoTime_SingleInstance_Mutex"
 SHOW_EVENT_NAME = "Local\\AutoGeoTime_ShowFlyout_Event"
 FONT_MAIN = "Segoe UI"
@@ -160,7 +161,6 @@ def is_admin():
 
 
 def elevate_if_needed():
-    """درخواست خودکار دسترسی Administrator برای نوشتن مختصات GPS در HKLM رجیستری"""
     if not is_admin():
         params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
         if getattr(sys, "frozen", False):
@@ -212,18 +212,63 @@ def broadcast_windows_time_update():
     user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "intl", SMTO_ABORTIFHUNG, 1000, None)
 
 
+def configure_geolocation_override(enable=True):
+    """
+    مدیریت سرویس Location ویندوز و مسدودسازی موقعیت‌یابی آنلاین مایکروسافت (lfsvc)
+    تا ویندوز همیشه فقط مختصات ثبت‌شده DefaultLocation را برگرداند.
+    """
+    try:
+        # حذف قانون قبلی فایروال در هر دو حالت برای جلوگیری از تکرار
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FW_RULE_NAME}"],
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        if enable:
+            # ۱. فعال‌سازی دسترسی Location در رجیستری برای سیستم و برنامه‌های دسکتاپ
+            consent_paths = [
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location",
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location\NonPackaged"
+            ]
+            for c_path in consent_paths:
+                with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, c_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+                    winreg.SetValueEx(key, "Value", 0, winreg.REG_SZ, "Allow")
+
+            # ۲. مسدودسازی دسترسی اینترنت سرویس lfsvc در فایروال ویندوز (جلوگیری از خواندن IP واقعی/Wi-Fi)
+            svchost_path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "svchost.exe")
+            subprocess.run(
+                [
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={FW_RULE_NAME}",
+                    "dir=out",
+                    "action=block",
+                    f"program={svchost_path}",
+                    "service=lfsvc",
+                    "enable=yes"
+                ],
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            # ۳. روشن کردن و ری‌استارت سرویس lfsvc برای اعمال فوری DefaultLocation
+            subprocess.run(["sc", "config", "lfsvc", "start=", "auto"], check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["net", "stop", "lfsvc"], check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["net", "start", "lfsvc"], check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+
 def set_windows_default_gps(lat, lon, city="", country=""):
     """ثبت مختصات جغرافیایی (Latitude و Longitude) در رجیستری DefaultLocation ویندوز ۱۰/۱۱"""
     if lat is None or lon is None:
         return False
     try:
-        # تبدیل float به باینری 8 بایتی (REG_BINARY / Double) برای کلیدهای اصلی DefaultLocation ویندوز
         lat_bytes = struct.pack("<d", float(lat))
         lon_bytes = struct.pack("<d", float(lon))
         alt_bytes = struct.pack("<d", 15.0)
         err_bytes = struct.pack("<d", 50.0)
 
-        # زمان فعلی FILETIME ویندوز (100-nanosecond intervals since Jan 1, 1601)
         filetime = int((time.time() + 11644473600) * 10000000)
         ts_bytes = struct.pack("<Q", filetime)
 
@@ -243,11 +288,11 @@ def set_windows_default_gps(lat, lon, city="", country=""):
                     label = f"{city}, {country}".strip(", ")
                     winreg.SetValueEx(key, "Address", 0, winreg.REG_SZ, label)
 
-        # فعال‌سازی استفاده از DefaultLocation در صورت عدم وجود سخت‌افزار GPS
         override_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}"
         with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, override_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
             winreg.SetValueEx(key, "SensorPermissionState", 0, winreg.REG_DWORD, 1)
 
+        configure_geolocation_override(True)
         return True
     except Exception:
         return False
@@ -463,7 +508,7 @@ class AutoGeoTimeFlyout:
         footer.pack(fill="x")
 
         admin_tag = "Admin" if is_admin() else "User"
-        tk.Label(footer, text=f"v2.1 GPS ({admin_tag})", bg="#FFFFFF", fg="#94A3B8", font=(FONT_MAIN, 7)).pack(side="left")
+        tk.Label(footer, text=f"v2.2 GPS ({admin_tag})", bg="#FFFFFF", fg="#94A3B8", font=(FONT_MAIN, 7)).pack(side="left")
         self.lbl_footer = tk.Label(footer, text="آماده پایش...", bg="#FFFFFF", fg="#64748B", font=(FONT_MAIN, 8))
         self.lbl_footer.pack(side="right")
 
@@ -538,7 +583,7 @@ class AutoGeoTimeFlyout:
             except Exception:
                 pass
 
-        # ۳. ثبت مختصات GPS در رجیستری ویندوز (DefaultLocation)
+        # ۳. ثبت مختصات GPS در رجیستری و اولویت‌دهی اجباری به DefaultLocation
         gps_ok = False
         if self.sync_gps_enabled and lat is not None and lon is not None:
             gps_ok = set_windows_default_gps(lat, lon, city, country)
@@ -559,7 +604,7 @@ class AutoGeoTimeFlyout:
         self.current_location_text = f"{loc_display} ({geo_id})" if geo_id else loc_display
 
         if lat is not None and lon is not None:
-            status_mark = "✓" if gps_ok else "!"
+            status_mark = "✓" if gps_ok else "Off"
             self.current_coords_text = f"{float(lat):.4f}, {float(lon):.4f} ({status_mark})"
         else:
             self.current_coords_text = "---"
@@ -640,42 +685,63 @@ class AutoGeoTimeFlyout:
 
     def on_toggle_gps(self, state):
         self.sync_gps_enabled = state
-        if state and self.is_monitoring:
-            self.force_sync()
+        if state:
+            if self.is_monitoring:
+                self.force_sync()
+        else:
+            # بازگرداندن دسترسی آنلاین سرویس lfsvc به حالت عادی
+            threading.Thread(target=configure_geolocation_override, args=(False,), daemon=True).start()
 
     def on_toggle_locale(self, state):
         self.sync_locale_enabled = state
         if state and self.is_monitoring:
             self.force_sync()
 
+    # مدیریت Startup از طریق Task Scheduler (بدون نمایش پنجره UAC در بوت)
     def is_in_startup(self):
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-            winreg.QueryValueEx(key, APP_NAME)
-            winreg.CloseKey(key)
-            return True
-        except FileNotFoundError:
-            return False
+        res = subprocess.run(
+            ["schtasks", "/query", "/tn", APP_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return res.returncode == 0
 
     def on_toggle_startup(self, state):
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-            if state:
-                exe_path = (
-                    f'"{sys.executable}" --minimized'
-                    if getattr(sys, "frozen", False)
-                    else f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
-                )
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
-            else:
+            # پاکسازی کلید قدیمی رجیستری در صورت وجود
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
                 except FileNotFoundError:
                     pass
-            winreg.CloseKey(key)
         except Exception:
             pass
+
+        if state:
+            if getattr(sys, "frozen", False):
+                tr_cmd = f'"{sys.executable}" --minimized'
+            else:
+                tr_cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
+            subprocess.run(
+                [
+                    "schtasks", "/create", "/f",
+                    "/tn", APP_NAME,
+                    "/tr", tr_cmd,
+                    "/sc", "onlogon",
+                    "/rl", "highest"
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            subprocess.run(
+                ["schtasks", "/delete", "/f", "/tn", APP_NAME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
 
     def setup_tray(self):
         menu = pystray.Menu(
