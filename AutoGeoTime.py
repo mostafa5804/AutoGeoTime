@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import struct
 import threading
 import subprocess
 import winreg
@@ -115,7 +116,6 @@ IANA_TO_WINDOWS_TZ = {
     "Pacific/Auckland": "New Zealand Standard Time",
 }
 
-# نگاشت کامل کدهای GeoID ویندوز
 COUNTRY_TO_GEOID = {
     "AF": 3, "AL": 6, "DZ": 4, "AR": 11, "AM": 7, "AU": 12, "AT": 14, "AZ": 5,
     "BH": 17, "BD": 23, "BY": 29, "BE": 21, "BR": 32, "BG": 35, "KH": 40, "CA": 39,
@@ -132,7 +132,6 @@ COUNTRY_TO_GEOID = {
     "US": 244, "UY": 246, "UZ": 247, "VE": 249, "VN": 251
 }
 
-# نگاشت کد کشور به Regional Format استاندارد ویندوز (LocaleName)
 COUNTRY_TO_LOCALE = {
     "US": "en-US", "GB": "en-GB", "CA": "en-CA", "AU": "en-AU", "NZ": "en-NZ",
     "NL": "nl-NL", "DE": "de-DE", "AT": "de-AT", "CH": "de-CH", "FR": "fr-FR",
@@ -153,13 +152,31 @@ SHOW_EVENT_NAME = "Local\\AutoGeoTime_ShowFlyout_Event"
 FONT_MAIN = "Segoe UI"
 
 
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def elevate_if_needed():
+    """درخواست خودکار دسترسی Administrator برای نوشتن مختصات GPS در HKLM رجیستری"""
+    if not is_admin():
+        params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+        if getattr(sys, "frozen", False):
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        else:
+            script = os.path.abspath(__file__)
+            full_params = f'"{script}" {params}'.strip()
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, full_params, None, 1)
+        sys.exit(0)
+
+
 def check_single_instance():
-    """جلوگیری از اجرای همزمان چند نسخه و باز کردن پنل نسخه قبلی"""
     kernel32 = ctypes.windll.kernel32
     mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    last_error = kernel32.GetLastError()
-    if last_error == 183:  # ERROR_ALREADY_EXISTS
-        event = kernel32.OpenEventW(0x0002, False, SHOW_EVENT_NAME)  # EVENT_MODIFY_STATE
+    if kernel32.GetLastError() == 183:
+        event = kernel32.OpenEventW(0x0002, False, SHOW_EVENT_NAME)
         if event:
             kernel32.SetEvent(event)
             kernel32.CloseHandle(event)
@@ -186,7 +203,6 @@ def load_bundled_fonts():
 
 
 def broadcast_windows_time_update():
-    """ارسال سیگنال سیستمی برای آپدیت فوری ساعت Taskbar بدون تأخیر"""
     HWND_BROADCAST = 0xFFFF
     WM_SETTINGCHANGE = 0x001A
     WM_TIMECHANGE = 0x001E
@@ -196,12 +212,52 @@ def broadcast_windows_time_update():
     user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "intl", SMTO_ABORTIFHUNG, 1000, None)
 
 
+def set_windows_default_gps(lat, lon, city="", country=""):
+    """ثبت مختصات جغرافیایی (Latitude و Longitude) در رجیستری DefaultLocation ویندوز ۱۰/۱۱"""
+    if lat is None or lon is None:
+        return False
+    try:
+        # تبدیل float به باینری 8 بایتی (REG_BINARY / Double) برای کلیدهای اصلی DefaultLocation ویندوز
+        lat_bytes = struct.pack("<d", float(lat))
+        lon_bytes = struct.pack("<d", float(lon))
+        alt_bytes = struct.pack("<d", 15.0)
+        err_bytes = struct.pack("<d", 50.0)
+
+        # زمان فعلی FILETIME ویندوز (100-nanosecond intervals since Jan 1, 1601)
+        filetime = int((time.time() + 11644473600) * 10000000)
+        ts_bytes = struct.pack("<Q", filetime)
+
+        reg_paths = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location\DefaultLocation",
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}"
+        ]
+
+        for path in reg_paths:
+            with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+                winreg.SetValueEx(key, "Latitude", 0, winreg.REG_BINARY, lat_bytes)
+                winreg.SetValueEx(key, "Longitude", 0, winreg.REG_BINARY, lon_bytes)
+                winreg.SetValueEx(key, "Altitude", 0, winreg.REG_BINARY, alt_bytes)
+                winreg.SetValueEx(key, "ErrorRadius", 0, winreg.REG_BINARY, err_bytes)
+                winreg.SetValueEx(key, "Timestamp", 0, winreg.REG_BINARY, ts_bytes)
+                if city or country:
+                    label = f"{city}, {country}".strip(", ")
+                    winreg.SetValueEx(key, "Address", 0, winreg.REG_SZ, label)
+
+        # فعال‌سازی استفاده از DefaultLocation در صورت عدم وجود سخت‌افزار GPS
+        override_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}"
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, override_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+            winreg.SetValueEx(key, "SensorPermissionState", 0, winreg.REG_DWORD, 1)
+
+        return True
+    except Exception:
+        return False
+
+
 def render_app_icon(state="active", size=128):
-    """آیکون گرافیکی: سبز (متصل/فعال)، قرمز (قطع/متوقف)، آبی (در حال تغییر)"""
     colors = {
-        "active": (16, 185, 129, 255),   # #10B981 سبز
-        "paused": (239, 68, 68, 255),    # #EF4444 قرمز
-        "syncing": (59, 130, 246, 255),  # #3B82F6 آبی
+        "active": (16, 185, 129, 255),
+        "paused": (239, 68, 68, 255),
+        "syncing": (59, 130, 246, 255),
     }
     bg = colors.get(state, colors["active"])
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -216,12 +272,10 @@ def render_app_icon(state="active", size=128):
 
     cx, cy = size // 2, size // 2
     if state == "paused":
-        # علامت قطع (ضربدر ظریف داخل حلقه)
         d = int(size * 0.13)
         draw.line((cx - d, cy - d, cx + d, cy + d), fill="white", width=stroke_w)
         draw.line((cx + d, cy - d, cx - d, cy + d), fill="white", width=stroke_w)
     else:
-        # عقربه‌های ساعت
         draw.line((cx, cy, cx, int(size * 0.30)), fill="white", width=stroke_w)
         draw.line((cx, cy, int(size * 0.66), int(size * 0.56)), fill="white", width=stroke_w)
 
@@ -264,8 +318,8 @@ class ToggleSwitch(tk.Canvas):
 class AutoGeoTimeFlyout:
     def __init__(self, root):
         self.root = root
-        self.win_width = 320
-        self.win_height = 420
+        self.win_width = 330
+        self.win_height = 475
 
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -273,9 +327,11 @@ class AutoGeoTimeFlyout:
 
         self.is_monitoring = True
         self.sync_locale_enabled = True
+        self.sync_gps_enabled = True
         self.last_ip = None
         self.current_ip = "در حال بررسی..."
         self.current_location_text = "---"
+        self.current_coords_text = "---"
         self.current_tz = "---"
         self.tray_icon = None
         self.is_visible = True
@@ -285,7 +341,6 @@ class AutoGeoTimeFlyout:
         self.position_near_clock()
         self.root.bind("<FocusOut>", self.on_focus_out)
 
-        # تردهای پس‌زمینه: پایش IP، رصد آداپتور شبکه و گوش دادن به سیگنال Single Instance
         threading.Thread(target=self.monitor_loop, daemon=True).start()
         threading.Thread(target=self.network_route_watcher, daemon=True).start()
         threading.Thread(target=self.single_instance_listener, daemon=True).start()
@@ -316,7 +371,7 @@ class AutoGeoTimeFlyout:
         self.badge_frame.pack(side="left")
         self.lbl_badge = tk.Label(
             self.badge_frame,
-            text="● پایش فعال",
+            text="● متصل و فعال",
             bg="#DCFCE7",
             fg="#166534",
             font=(FONT_MAIN, 8, "bold")
@@ -337,6 +392,7 @@ class AutoGeoTimeFlyout:
 
         self.lbl_ip = self._add_info_row(card, ":آی‌پی عمومی", "در حال بررسی...")
         self.lbl_country = self._add_info_row(card, ":موقعیت سرور", "---")
+        self.lbl_coords = self._add_info_row(card, ":مختصات GPS", "---")
         self.lbl_tz = self._add_info_row(card, ":منطقه زمانی", "---")
 
         # کلیدهای قطع و وصل
@@ -348,6 +404,12 @@ class AutoGeoTimeFlyout:
         self.sw_auto = ToggleSwitch(row_auto, initial=True, command=self.on_toggle_monitoring)
         self.sw_auto.pack(side="left")
         tk.Label(row_auto, text="پایش خودکار تغییر VPN", bg="#FFFFFF", fg="#0F172A", font=(FONT_MAIN, 9)).pack(side="right")
+
+        row_gps = tk.Frame(toggles_frame, bg="#FFFFFF")
+        row_gps.pack(fill="x", pady=4)
+        self.sw_gps = ToggleSwitch(row_gps, initial=True, command=self.on_toggle_gps)
+        self.sw_gps.pack(side="left")
+        tk.Label(row_gps, text="ثبت مختصات GPS شهر (DefaultLocation)", bg="#FFFFFF", fg="#0F172A", font=(FONT_MAIN, 9)).pack(side="right")
 
         row_locale = tk.Frame(toggles_frame, bg="#FFFFFF")
         row_locale.pack(fill="x", pady=4)
@@ -400,7 +462,8 @@ class AutoGeoTimeFlyout:
         footer = tk.Frame(container, bg="#FFFFFF")
         footer.pack(fill="x")
 
-        tk.Label(footer, text="v2.0 Smart", bg="#FFFFFF", fg="#94A3B8", font=(FONT_MAIN, 7)).pack(side="left")
+        admin_tag = "Admin" if is_admin() else "User"
+        tk.Label(footer, text=f"v2.1 GPS ({admin_tag})", bg="#FFFFFF", fg="#94A3B8", font=(FONT_MAIN, 7)).pack(side="left")
         self.lbl_footer = tk.Label(footer, text="آماده پایش...", bg="#FFFFFF", fg="#64748B", font=(FONT_MAIN, 8))
         self.lbl_footer.pack(side="right")
 
@@ -431,7 +494,7 @@ class AutoGeoTimeFlyout:
 
     def get_ip_info(self):
         apis = [
-            "http://ip-api.com/json/?fields=status,countryCode,city,timezone,query",
+            "http://ip-api.com/json/?fields=status,countryCode,city,lat,lon,timezone,query",
             "https://ipapi.co/json/"
         ]
         for url in apis:
@@ -442,14 +505,16 @@ class AutoGeoTimeFlyout:
                     ip = data.get("query") or data.get("ip")
                     country = data.get("countryCode") or data.get("country_code")
                     city = data.get("city") or ""
+                    lat = data.get("lat") if "lat" in data else data.get("latitude")
+                    lon = data.get("lon") if "lon" in data else data.get("longitude")
                     tz = data.get("timezone")
                     if ip and country and tz:
-                        return ip, country.upper(), city, tz
+                        return ip, country.upper(), city, lat, lon, tz
             except Exception:
                 continue
-        return None, None, None, None
+        return None, None, None, None, None, None
 
-    def apply_system_settings(self, ip, country, city, iana_tz):
+    def apply_system_settings(self, ip, country, city, lat, lon, iana_tz):
         self.set_visual_state("syncing")
         win_tz = IANA_TO_WINDOWS_TZ.get(iana_tz)
         geo_id = COUNTRY_TO_GEOID.get(country)
@@ -473,7 +538,12 @@ class AutoGeoTimeFlyout:
             except Exception:
                 pass
 
-        # ۳. تغییر Regional Format (LocaleName) در صورت فعال بودن
+        # ۳. ثبت مختصات GPS در رجیستری ویندوز (DefaultLocation)
+        gps_ok = False
+        if self.sync_gps_enabled and lat is not None and lon is not None:
+            gps_ok = set_windows_default_gps(lat, lon, city, country)
+
+        # ۴. تغییر Regional Format (LocaleName)
         if self.sync_locale_enabled and locale_name:
             try:
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International", 0, winreg.KEY_SET_VALUE) as key:
@@ -481,18 +551,26 @@ class AutoGeoTimeFlyout:
             except Exception:
                 pass
 
-        # ۴. ارسال سیگنال آپدیت آنی ساعت نوار وظیفه ویندوز
+        # ۵. ارسال سیگنال آپدیت آنی ساعت نوار وظیفه ویندوز
         broadcast_windows_time_update()
 
         self.current_ip = ip
         loc_display = f"{city}, {country}" if city else country
         self.current_location_text = f"{loc_display} ({geo_id})" if geo_id else loc_display
+
+        if lat is not None and lon is not None:
+            status_mark = "✓" if gps_ok else "!"
+            self.current_coords_text = f"{float(lat):.4f}, {float(lon):.4f} ({status_mark})"
+        else:
+            self.current_coords_text = "---"
+
         self.current_tz = win_tz if win_tz else iana_tz
         now_str = time.strftime("%H:%M:%S")
 
         def _refresh_labels():
             self.lbl_ip.config(text=self.current_ip)
             self.lbl_country.config(text=self.current_location_text)
+            self.lbl_coords.config(text=self.current_coords_text)
             self.lbl_tz.config(text=self.current_tz)
             self.lbl_footer.config(text=f"آخرین تغییر: {now_str}")
 
@@ -501,14 +579,12 @@ class AutoGeoTimeFlyout:
         self.update_tray_tooltip()
 
     def network_route_watcher(self):
-        """رصد آنی تغییرات آداپتور شبکه و جدول مسیریابی (واکنش زیر ۱ ثانیه به قطع/وصل VPN)"""
         iphlpapi = ctypes.windll.iphlpapi
         while True:
             try:
-                # مسدود شدن ترد تا لحظه تغییر کارت شبکه یا اتصال/قطع VPN
                 iphlpapi.NotifyRouteChange(None, None)
                 if self.is_monitoring:
-                    time.sleep(0.8)  # فرصت کوتاه برای تثبیت مسیر تونل VPN
+                    time.sleep(0.8)
                     self.last_ip = None
                     self.wake_event.set()
             except Exception:
@@ -517,21 +593,18 @@ class AutoGeoTimeFlyout:
     def monitor_loop(self):
         while True:
             if self.is_monitoring:
-                ip, country, city, tz = self.get_ip_info()
+                ip, country, city, lat, lon, tz = self.get_ip_info()
                 if ip and ip != self.last_ip:
-                    self.apply_system_settings(ip, country, city, tz)
+                    self.apply_system_settings(ip, country, city, lat, lon, tz)
                     self.last_ip = ip
-            # انتظار تا ۱۰ ثانیه یا بیدار شدن فوری توسط رویداد تغییر شبکه
             self.wake_event.wait(timeout=10)
             self.wake_event.clear()
 
     def single_instance_listener(self):
-        """گوش دادن به درخواست باز کردن پنجره در صورت اجرای مجدد فایل EXE"""
         kernel32 = ctypes.windll.kernel32
         event = kernel32.CreateEventW(None, False, False, SHOW_EVENT_NAME)
         while True:
-            res = kernel32.WaitForSingleObject(event, 0xFFFFFFFF)
-            if res == 0:
+            if kernel32.WaitForSingleObject(event, 0xFFFFFFFF) == 0:
                 self.root.after(0, self.show_flyout)
 
     def force_sync(self):
@@ -540,9 +613,9 @@ class AutoGeoTimeFlyout:
 
     def _single_check(self):
         self.set_visual_state("syncing")
-        ip, country, city, tz = self.get_ip_info()
+        ip, country, city, lat, lon, tz = self.get_ip_info()
         if ip:
-            self.apply_system_settings(ip, country, city, tz)
+            self.apply_system_settings(ip, country, city, lat, lon, tz)
             self.last_ip = ip
         else:
             self.root.after(0, lambda: self.lbl_footer.config(text="خطا در دریافت اطلاعات IP"))
@@ -551,7 +624,7 @@ class AutoGeoTimeFlyout:
     def reset_to_iran(self):
         threading.Thread(
             target=self.apply_system_settings,
-            args=(self.current_ip, "IR", "Tehran", "Asia/Tehran"),
+            args=(self.current_ip, "IR", "Tehran", 35.6892, 51.3890, "Asia/Tehran"),
             daemon=True
         ).start()
 
@@ -564,6 +637,11 @@ class AutoGeoTimeFlyout:
         else:
             self.set_visual_state("paused")
         self.update_tray_tooltip()
+
+    def on_toggle_gps(self, state):
+        self.sync_gps_enabled = state
+        if state and self.is_monitoring:
+            self.force_sync()
 
     def on_toggle_locale(self, state):
         self.sync_locale_enabled = state
@@ -644,6 +722,7 @@ class AutoGeoTimeFlyout:
 
 
 if __name__ == "__main__":
+    elevate_if_needed()
     _mutex = check_single_instance()
     ensure_ico_file()
     load_bundled_fonts()
